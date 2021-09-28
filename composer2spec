@@ -1,0 +1,320 @@
+#!/usr/bin/env perl
+use warnings;
+use strict;
+use utf8::all;
+
+use Const::Fast;
+use Mojo::File;
+use Mojo::JSON qw( decode_json );
+use Mojo::Loader qw( data_section );
+use Mojo::Template;
+use Mojo::UserAgent;
+use URI::Escape qw( uri_escape_utf8 );
+
+package ComposerPackage {
+    use Moo;
+
+    use Const::Fast;
+
+    const my $PACKAGIST_API => 'https://repo.packagist.org/p2/';
+
+    has name => (
+        is       => 'ro',
+        required => 1,
+    );
+
+    has vendor => (
+        is       => 'ro',
+        required => 1,
+    );
+
+    has project => (
+        is       => 'ro',
+        required => 1,
+    );
+
+    around BUILDARGS => sub {
+        my ($orig, $class, $name) = @_;
+
+        unless ($name) {
+            die "Must provide package name\n";
+        }
+
+        my ($vendor, $project) = split qr!/!, $name, 2;
+        unless ($vendor && $project) {
+            die "Invalid package name, expected format VENDOR/PROJECT\n";
+        }
+
+        return $class->$orig(
+            name    => $name,
+            vendor  => $vendor,
+            project => $project,
+        );
+    };
+
+    sub packagist_api_url {
+        my $self = shift;
+        return $PACKAGIST_API . $self->name. '.json';
+    }
+
+    sub spec_name {
+        my $self = shift;
+        return sprintf('php-%s-%s.spec',
+            $self->vendor,
+            $self->project,
+        );
+    }
+
+};
+
+package ComposerDataProvider {
+    use Moo;
+
+    use Const::Fast;
+    use CHI;
+    use Mojo::UserAgent;
+
+    const my $CACHE_DIR => ( $ENV{XDG_CACHE_HOME} || $ENV{HOME} . '/.cache' ) . '/composer2spec';
+
+    has ua => (
+        is      => 'ro',
+        default => sub { Mojo::UserAgent->new->max_redirects(5) },
+    );
+
+    has cache => (
+        is      => 'ro',
+        default => sub {
+            return CHI->new(
+                driver   => 'File',
+                root_dir => $CACHE_DIR,
+            );
+        },
+    );
+
+    sub lookup {
+        my ($self, $package) = @_;
+
+        my $raw = $self->cache->compute($package->name, 'never', sub {
+            my $res = $self->ua->get($package->packagist_api_url)->result;
+            unless ($res->is_success) {
+                die 'Failed to download data from packagist: ' . $res->message . "\n";
+            }
+            return $res->json;
+        });
+
+        return ComposerData->new(
+            package => $package,
+            raw     => $raw->{packages}{ $package->name }[0],
+        );
+    }
+};
+
+package ComposerData {
+    use Moo;
+
+    has package => (
+        is       => 'ro',
+        required => 1,
+    );
+
+    has _raw => (
+        is       => 'ro',
+        required => 1,
+        init_arg => 'raw',
+    );
+
+    sub composer_requirements {
+        my $self = shift;
+
+        my @requires;
+        while (my ($package, $version) = each %{ $self->_raw->{require} || {} }) {
+            if ($package eq 'php') {
+                next;
+            }
+
+            push @requires, {
+                name    => $package,
+                version => main::convert_version($version),
+            };
+        }
+
+        return \@requires;
+    }
+
+    sub git_hash {
+        my $self = shift;
+        return $self->_raw->{source}{reference};
+    }
+
+    sub git_short_hash {
+        my $self = shift;
+        return substr($self->git_hash, 0, 7);
+    }
+
+    sub php_version {
+        my $self = shift;
+        return main::convert_version($self->_raw->{require}{php});
+    }
+
+    sub psr_namespace {
+        my $self = shift;
+
+        my @ns = keys %{ $self->_raw->{autoload}{'psr-4'} || {} };
+        unless (@ns) {
+            die "Could not determine namespace from composer data: missing autoload.psr-4?\n";
+        }
+        if (@ns > 1) {
+            die "Could not determine namespace from composer data: more than one entry found in autoload.psr-4\n";
+        }
+
+        return $ns[0];
+    }
+
+    sub description {
+        my $self = shift;
+        return $self->_raw->{description};
+    }
+
+    sub license {
+        my $self = shift;
+        return join ' and ', @{ $self->_raw->{license} };
+    }
+
+    sub source_url {
+        my $self = shift;
+        return $self->_raw->{dist}{url};
+    }
+
+    sub url {
+        my $self = shift;
+        return $self->_raw->{source}{url};
+    }
+
+    sub version {
+        my $self = shift;
+        return $self->_raw->{version};
+    }
+}
+
+my $package  = ComposerPackage->new(shift);
+my $composer = ComposerDataProvider->new->lookup($package);
+
+generate_autoloader($composer);
+generate_spec($composer);
+exit;
+
+sub generate_autoloader {
+    my $data = shift;
+
+    my @requires;
+    foreach my $requirement (@{ $data->composer_requirements || [] }) {
+        push @requires, "/usr/share/php/$requirement->{name}/autoload.php";
+    }
+
+    my $template = data_section 'main', 'autoload.php';
+    my $autoload = Mojo::Template->new->vars(1)->render($template, {
+        namespace => $data->psr_namespace =~ s/\\/\\\\/gr,
+        requires  => \@requires,
+    });
+
+    my $path = Mojo::File->new('autoload.php');
+    $path->spurt($autoload);
+}
+
+sub generate_spec {
+    my $data = shift;
+
+    my @requires;
+    if (my $version = $data->php_version) {
+        push @requires, "Requires:   php(language) $version";
+    }
+    foreach my $requires (@{ $data->composer_requirements || [] }) {
+        push @requires, "Requires:   php-composer($requires->{name}) $requires->{version}";
+    }
+
+    my $template = data_section 'main', 'spec.spec';
+    my $spec = Mojo::Template->new->vars(1)->render($template, {
+        composer_vendor  => $data->package->vendor,
+        composer_project => $data->package->project,
+        git_short_hash   => $data->git_short_hash,
+        data             => $data,
+        requires         => \@requires,
+    });
+
+    my $path = Mojo::File->new($data->package->spec_name);
+    $path->spurt($spec);
+}
+
+sub convert_version {
+    my $version = shift;
+
+    # spec files don't natively support semver
+    # it should be possible to achieve manually using two version constraints
+    $version =~ s/^\^/>= /;
+
+    # spec files require a space between the comparison operator and version
+    $version =~ s/^([^\d]+)/$1 /;
+
+    return $version;
+}
+
+__DATA__
+
+@@ autoload.php
+<?php
+
+  require_once '/usr/share/php/Fedora/Autoloader/autoload.php';
+
+  \Fedora\Autoloader\Autoload::addPsr4('<%= $namespace %>', __DIR__);
+% if (@$requires) {
+
+  \Fedora\Autoloader\Dependencies::required([
+%   foreach my $require (@$requires) {
+      '<%= $require %>',
+%   }
+   ]);
+% }
+
+@@ spec.spec
+%%global composer_vendor  <%= $composer_vendor %>
+%%global composer_project <%= $composer_project %>
+%%global composer_version <%= $data->version %>
+
+%%{!?phpdir: %global phpdir %{_datadir}/php}
+
+Name:       php-%{composer_vendor}-%{composer_project}
+Version:    <%= $data->version %>
+Release:    1%{?dist}
+Summary:    <%= $data->description %>
+License:    <%= $data->license %>
+URL:        <%= $data->url %>
+Source0:    <%= $data->source_url %>
+Source1:    autoload.php
+
+Provides:   php-composer(%{composer_vendor}/%{composer_project}) = %{version}
+Requires:   php-composer(fedora/autoloader)
+% foreach my $require (@$requires) {
+%= $require
+% }
+
+BuildArch:  noarch
+
+%%description
+%= $data->description
+
+%%prep
+%%setup -qn <%= $composer_vendor %>-<%= $composer_project %>-<%= $git_short_hash %>
+
+%%build
+install -m 0644 %{SOURCE1} src
+
+%%install
+mkdir -p %{buildroot}%{phpdir}/<%= $composer_vendor %>
+cp -a src %{buildroot}%{phpdir}/<%= $composer_vendor %>/<%= $composer_project %>
+
+%%files
+%%license LICENSE
+%%doc    *.md
+%%doc    composer.json
+
+%%{phpdir}/<%= $composer_vendor %>/<%= $composer_project %>
